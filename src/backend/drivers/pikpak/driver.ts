@@ -177,13 +177,27 @@ export class PikPakDriver implements StorageDriver {
       thumbnail_size: "SIZE_LARGE",
     }
 
-    const f: PikPakFile = await this.client.request(
+    let f: PikPakFile = await this.client.request(
       `https://api-drive.mypikpak.net/drive/v1/files/${encodeURIComponent(fileId)}`,
       {
         method: "GET",
         params: queryParams,
       },
     )
+
+    // PikPak 服务端在 usage=CACHE 下对非媒体文件（txt/nfo/md5 等）不返回 web_content_link，
+    // 也没有 medias，导致下载接口拿不到直链；此时回退 usage=FETCH 重新获取一次
+    if (
+      queryParams.usage === "CACHE" &&
+      f.kind !== "drive#folder" &&
+      !f.web_content_link &&
+      !(f.medias && f.medias.length > 0 && f.medias[0].link?.url)
+    ) {
+      f = await this.client.request(
+        `https://api-drive.mypikpak.net/drive/v1/files/${encodeURIComponent(fileId)}`,
+        { method: "GET", params: { ...queryParams, usage: "FETCH" } },
+      )
+    }
 
     const isDir = f.kind === "drive#folder"
     let rawUrl = f.web_content_link || ""
@@ -353,6 +367,40 @@ export class PikPakDriver implements StorageDriver {
         },
       },
     )
+  }
+
+  readonly rapidHashAlgos = ["sha1"]
+  readonly rapidHashNeedsPieces = false
+
+  async rapidUpload(
+    _virtualPath: string,
+    physicalPath: string,
+    metadata: { size: number; sha1?: string },
+  ): Promise<boolean> {
+    const sha1Hex = String(metadata.sha1 || "").toUpperCase()
+    if (!/^[0-9A-F]{40}$/.test(sha1Hex)) return false
+    const clean = this.cleanPath(physicalPath)
+    const parentPath = clean.split("/").slice(0, -1).join("/")
+    const fileName = clean.split("/").pop() || "upload"
+    const parentId = await this.resolveParentId(parentPath)
+    const taskResp: any = await this.client.request(
+      "https://api-drive.mypikpak.net/drive/v1/files",
+      {
+        method: "POST",
+        body: {
+          kind: "drive#file",
+          name: fileName,
+          size: String(metadata.size),
+          hash: sha1Hex,
+          upload_type: "UPLOAD_TYPE_RESUMABLE",
+          objProvider: { provider: "UPLOAD_TYPE_UNKNOWN" },
+          parent_id: parentId,
+          folder_type: "NORMAL",
+        },
+      },
+    )
+    // A successful rapid upload returns the file without a resumable session.
+    return !taskResp?.resumable
   }
 
   async put(

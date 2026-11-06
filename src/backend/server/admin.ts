@@ -12,6 +12,10 @@ import { checkAdminAuth } from "../pkg/utils"
 import { safeErrorMessage } from "../pkg/errs"
 import { validateHide } from "../pkg/meta"
 import {
+  isTranscodeSettingKey,
+  stripTranscodeSettings,
+} from "../internal/model/transcode-guard"
+import {
   PROXY_RANGE_DRIVERS,
   driverMustProxy,
   driverPreferProxy,
@@ -523,6 +527,7 @@ adminRouter.get("/driver/names", (c) => {
       "Onedrive",
       "OnedriveAPP",
       "Quark",
+      "QuarkUcTv",
       "123Pan",
       "BaiduNetdisk",
       "115Open",
@@ -1125,6 +1130,68 @@ const driverConfigs: Record<string, any> = {
       only_proxy: false,
       no_cache: false,
       no_upload: false,
+      need_ms: false,
+      default_root: "0",
+    },
+  },
+  QuarkUcTv: {
+    name: "QuarkUcTv",
+    default_mount_path: "/quarktv",
+    common: COMMON_FIELDS,
+    additional: [
+      {
+        name: "variant",
+        type: "select",
+        options: "Quark,UC",
+        default: "Quark",
+        required: true,
+        help: "夸克 TV 端选 Quark，UC TV 端选 UC（服务端固定协议参数）",
+      },
+      {
+        name: "refresh_token",
+        type: "text",
+        default: "",
+        required: true,
+        help: "通过 extscreen 授权流程获取（http://api.extscreen.com/quarkdrive，UC 用 /ucdrive），必填",
+      },
+      {
+        name: "device_id",
+        type: "string",
+        default: "",
+        required: false,
+        help: "自定义设备标识，留空自动生成",
+      },
+      {
+        name: "order_by",
+        type: "select",
+        options: "file_name,updated_at",
+        default: "file_name",
+        required: false,
+      },
+      {
+        name: "order_direction",
+        type: "select",
+        options: "asc,desc",
+        default: "asc",
+        required: false,
+      },
+      {
+        name: "link_method",
+        type: "select",
+        options: "download,streaming",
+        default: "download",
+        required: false,
+        help: "播放/下载链接的获取方式；视频可选 streaming 转码档",
+      },
+    ],
+    config: {
+      name: "QuarkUcTv",
+      local_sort: true,
+      only_local: false,
+      only_proxy: false,
+      no_cache: false,
+      // 只读驱动：仅实现 list/get，不支持上传
+      no_upload: true,
       need_ms: false,
       default_root: "0",
     },
@@ -4457,9 +4524,36 @@ const driverConfigs: Record<string, any> = {
         type: "string",
         default: "",
         required: false,
-        help: "手机号（登录用，+86 格式）",
+        help: "手机号（短信登录用，+86 格式）。两段式登录：先填手机号并设 send_code=true 保存以发送验证码，再填入 verify_code 保存完成登录",
       },
-      { name: "verify_code", type: "string", default: "", required: false },
+      {
+        name: "captcha_token",
+        type: "string",
+        default: "",
+        required: false,
+        help: "图形验证 token（发短信需要时提供；置空时驱动会自动获取）",
+      },
+      {
+        name: "send_code",
+        type: "bool",
+        default: "",
+        required: false,
+        help: "设为 true 并保存以发送短信验证码，发送后自动复位为 false",
+      },
+      {
+        name: "verify_code",
+        type: "string",
+        default: "",
+        required: false,
+        help: "短信验证码，与 phone_number 配合使用，保存后完成登录",
+      },
+      {
+        name: "verification_id",
+        type: "string",
+        default: "",
+        required: false,
+        help: "发送短信后自动生成，请勿手动修改",
+      },
       { name: "page_size", type: "number", default: "100", required: false },
       { name: "order_by", type: "number", default: "3", required: false },
       { name: "sort_type", type: "number", default: "1", required: false },
@@ -4634,6 +4728,9 @@ adminRouter.get("/setting/list", async (c) => {
 
   let settings = db.settings || []
 
+  // Worker 没有 ffmpeg：转码设置一律不下发，避免前端展示永远失败的开关
+  settings = stripTranscodeSettings(settings)
+
   if (groupQuery !== undefined) {
     const groupNum = parseInt(groupQuery, 10)
     settings = settings.filter((s: any) => s.group === groupNum)
@@ -4660,6 +4757,16 @@ adminRouter.post("/setting/save", async (c) => {
     const key = item.key
     if (typeof key !== "string" || key.length === 0 || key.length > 128)
       continue
+
+    // Worker 不支持转码：拒绝写入，并把历史遗留的开关强制落成 false。
+    // 只跳过该字段而不是整批返回 400，避免一次保存中其它合法设置被连带拒绝。
+    if (isTranscodeSettingKey(key)) {
+      const existing = db.settings.find((s: any) => s.key === key)
+      if (existing) {
+        existing.value = key === "transcode_enabled" ? "false" : ""
+      }
+      continue
+    }
 
     let value = item.value
     if (value !== null && typeof value === "object") {

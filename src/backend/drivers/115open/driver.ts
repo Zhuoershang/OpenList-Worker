@@ -181,7 +181,12 @@ export class Pan115Driver implements StorageDriver {
     if (cached) return cached
 
     // 用 GetFolderInfoByPath 一次性解析（Go Get 逻辑）
-    const fullPath = `/${rootId === "0" ? "" : rootId}${clean === "/" ? "" : clean}`
+    // 注意：115 的 folder/get_info 对 path 严格校验，必须是 "/xxx/yyy" 形式：
+    //   "/测试" → 正常；"//测试" → code 20001 目录名称不能为空；
+    //   "测试"（缺前导斜杠）→ code 990002 参数错误。
+    // 因此 root_id 为默认 "0" 时不能拼出前缀，否则会得到 "//xxx"。
+    const rootPrefix = rootId === "0" ? "" : `/${rootId}`
+    const fullPath = `${rootPrefix}${clean}`
     try {
       if (!this.reserve()) throw new Error("subrequest budget exceeded")
       const info = await this.client.getFolderInfoByPath(fullPath)
@@ -190,8 +195,14 @@ export class Pan115Driver implements StorageDriver {
         return info.file_id
       }
     } catch (e: any) {
-      // folder/get_info 只支持目录路径：参数错误(990002)/不存在(430004) → 回退逐层
-      if (e?.code !== ERR_OBJECT_NOT_FOUND && e?.code !== 990002) throw e
+      // folder/get_info 只支持目录路径：参数错误(990002)/空目录名(20001)/
+      // 不存在(430004) → 回退逐层解析（逐层用 ufile/files 列目录，不依赖 path 拼接）
+      if (
+        e?.code !== ERR_OBJECT_NOT_FOUND &&
+        e?.code !== 990002 &&
+        e?.code !== 20001
+      )
+        throw e
     }
     // 逐层解析
     const segs = clean.split("/").filter(Boolean)
@@ -399,6 +410,65 @@ export class Pan115Driver implements StorageDriver {
   }
 
   // ---- Upload（OSS 直传：秒传 → 二次校验 → PUT Object） ----
+
+  readonly rapidHashAlgos = ["sha1"]
+  readonly rapidHashNeedsPieces = false
+
+  async rapidUpload(
+    _virtualPath: string,
+    physicalPath: string,
+    metadata: {
+      size: number
+      sha1?: string
+      readRange?: (start: number, length: number) => Promise<Uint8Array>
+    },
+  ): Promise<boolean> {
+    const sha1Full = String(metadata.sha1 || "").toUpperCase()
+    if (!/^[0-9A-F]{40}$/.test(sha1Full) || !metadata.readRange) return false
+    const segs = String(physicalPath || "")
+      .split("/")
+      .filter(Boolean)
+    const fileName = segs.pop() || "file"
+    const parentPath = "/" + segs.join("/")
+    const parentId = await this.resolveFolderId(parentPath)
+    const fileSize = metadata.size
+    const preSize = Math.min(128 * 1024, fileSize)
+    const preId = (
+      await sha1(await metadata.readRange(0, preSize))
+    ).toUpperCase()
+    if (!this.reserve()) return false
+    let initResp = await this.client.uploadInit({
+      fileName,
+      fileSize,
+      target: parentId,
+      fileId: sha1Full,
+      preId,
+    })
+    if (initResp.status === 2) return true
+    // status 6/7/8 asks for a byte-range SHA1 proof before reusing the file.
+    if ([6, 7, 8].includes(initResp.status) && initResp.sign_check) {
+      const [start, end] = initResp.sign_check
+        .split("-")
+        .map((value) => parseInt(value, 10))
+      if (Number.isFinite(start) && Number.isFinite(end)) {
+        const signVal = (
+          await sha1(await metadata.readRange(start, end - start + 1))
+        ).toUpperCase()
+        if (!this.reserve()) return false
+        initResp = await this.client.uploadInit({
+          fileName,
+          fileSize,
+          target: parentId,
+          fileId: sha1Full,
+          preId,
+          signKey: initResp.sign_key,
+          signVal,
+        })
+        return initResp.status === 2
+      }
+    }
+    return false
+  }
 
   async put(
     _virtualPath: string,

@@ -52,7 +52,7 @@ import {
 import { parseZip, extractZipEntry, ZipArchive } from "../internal/archive/zip"
 import { assertSafeUrl, getTrustedHosts } from "../pkg/http"
 import { invalidatePaths } from "../internal/cache"
-import { seedRouter } from "./seed"
+import { seedRouter, torrentLegacyRouter } from "./seed"
 import { r2CanSignDirectUpload } from "../drivers/r2/driver"
 
 /**
@@ -82,6 +82,7 @@ import {
 
 export const fsRouter = new Hono()
 fsRouter.route("/seed", seedRouter)
+fsRouter.route("/torrent", torrentLegacyRouter)
 
 /**
  * 请求级存储上下文（`env` + `waitUntil`）。
@@ -248,6 +249,16 @@ fsRouter.post("/dirs", async (c) => {
   if (!body.force_root) {
     reqPath = getActualPath(user, reqPath)
   }
+  if (body.refresh) {
+    try {
+      await invalidatePaths([reqPath], c.env)
+    } catch (err) {
+      console.warn(
+        `[fs/dirs] refresh: invalidating cache for "${reqPath}" failed:`,
+        err,
+      )
+    }
+  }
   try {
     // Share path support for completeness
     if (reqPath.startsWith("/@s")) {
@@ -322,6 +333,19 @@ fsRouter.post("/list", async (c) => {
   const page = parseInt(body.page, 10) || 1
   const perPage = parseInt(body.per_page, 10) || 0
 
+  // 对齐 Go 版 handles.FsList：refresh=true 时失效该路径的文件树/链接
+  // 缓存，允许用户在缓存 TTL 内手动刷新（此前 refresh 参数未实现，
+  // 缓存内的错误列表最长 30 分钟无法自救）。
+  if (body.refresh) {
+    try {
+      await invalidatePaths([reqPath], c.env)
+    } catch (err) {
+      console.warn(
+        `[fs] refresh: invalidating cache for "${reqPath}" failed:`,
+        err,
+      )
+    }
+  }
   const paginateItems = <T>(items: T[]) => {
     const total = items.length
     if (perPage <= 0) {
@@ -573,7 +597,9 @@ fsRouter.post("/list", async (c) => {
     // 对齐 Go 的路径级缓存策略；前端/上层可据此决定该目录的列表缓存时长。
     const cacheExpiration = storage
       ? resolveCacheExpiration(storage, reqPath)
-      : undefined
+      : 0 // Virtual directories must not be cached; a cached Virtual result
+          // would persist after the real storage comes online, causing the
+          // 'always shows root / Virtual provider' symptom for subsequent requests.
     return c.json({
       code: 200,
       message: "success",
@@ -1023,7 +1049,8 @@ fsRouter.put("/form", async (c) => {
         data: null,
       })
     }
-    const buffer = Buffer.from(await (file as File).arrayBuffer())
+    // 用 Uint8Array 而非 Buffer：ESA 边缘运行时没有全局 Buffer（Issue #169）
+    const buffer = new Uint8Array(await (file as File).arrayBuffer())
     // multipart 的 Content-Length 只覆盖整个表单，仍需按文件实际字节复核
     const max = getUploadSizeLimit(c, false)
     if (buffer.length > max) return tooLargeResponse(c, max)
@@ -2004,7 +2031,7 @@ fsRouter.post("/archive/decompress", async (c) => {
           continue
         }
         const content = await extractZipEntry(bytes, entry)
-        await putItem(targetPath, Buffer.from(content), getStorageRequestContext(c))
+        await putItem(targetPath, content, getStorageRequestContext(c))
         count++
       }
     }
